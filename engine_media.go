@@ -1016,7 +1016,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				vh.Marker,
 				media.Payload,
 			)
-			if recoveryNeeded && shouldSendVideoPLI(lastVideoPLI, vh.Ssrc, time.Now()) {
+			if (recoveryNeeded || e.pendingVideoKeyframeRequest(callID, false)) && shouldSendVideoPLI(lastVideoPLI, vh.Ssrc, time.Now()) {
+				e.pendingVideoKeyframeRequest(callID, true)
 				packet, feedbackErr := videoRtcp.pictureLossIndication(vh.Ssrc)
 				if feedbackErr == nil {
 					_, feedbackErr = ch.Send(packet)

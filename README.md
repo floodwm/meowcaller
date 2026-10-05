@@ -1,4 +1,12 @@
 # meowcaller
+
+## Wappi fork
+
+This fork keeps the official `go.mau.fi/whatsmeow` client and the patches used by
+gowapi. The original module path remains `github.com/purpshell/meowcaller` for
+upstream compatibility; consumers use a versioned Go `replace` to this fork.
+See [WAPPI.md](WAPPI.md) for setup and updates, and [PROVENANCE.md](PROVENANCE.md)
+for the local changes and validation boundaries.
 [![Go Reference](https://pkg.go.dev/badge/github.com/purpshell/meowcaller.svg)](https://pkg.go.dev/github.com/purpshell/meowcaller)
 
 meowcaller is a Go library for the WhatsApp Web VoIP stack. It is 100% pure GO without CGO and it has minimal dependencies. It includes the novel proprietary audio codec MLOW written and validated completely in GO. In turn, meowcaller does not rely on any native bindings and can run everywhere that GO can.

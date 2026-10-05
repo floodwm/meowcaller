@@ -2,11 +2,12 @@ package meowcaller
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/purpshell/meowcaller/signaling"
-	"github.com/polymorfa/hypermeow/types"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // Call is one live direct or group call. A direct call may become an ad-hoc group
@@ -18,6 +19,7 @@ type Call struct {
 
 	mu                        sync.Mutex
 	phase                     CallPhase
+	endReason                 string
 	player                    *Player
 	sink                      AudioSink
 	onReady                   func()
@@ -765,4 +767,28 @@ func (c *Call) setPhase(next CallPhase) {
 	if fn != nil {
 		fn(next)
 	}
+}
+
+// EndReason returns the first terminal reason once the call has ended. It allows
+// integrations to recover an end event that arrived before OnEnd registration.
+func (c *Call) EndReason() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase != CallPhaseEnded {
+		return ""
+	}
+	return c.endReason
+}
+
+// RequestVideoKeyframe coalesces receiver recovery requests. The next authenticated
+// peer video packet sends a rate limited SRTCP PLI through the media loop.
+func (c *Call) RequestVideoKeyframe() error {
+	c.eng.mu.Lock()
+	defer c.eng.mu.Unlock()
+	m := c.eng.calls[c.id]
+	if m == nil {
+		return errors.New("meowcaller: call is not active")
+	}
+	m.videoKeyframeRequested = true
+	return nil
 }

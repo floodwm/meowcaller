@@ -7,9 +7,9 @@ import (
 	"testing"
 
 	"github.com/purpshell/meowcaller/signaling"
-	waBinary "github.com/polymorfa/hypermeow/binary"
-	"github.com/polymorfa/hypermeow/types"
-	"github.com/polymorfa/hypermeow/types/events"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 type lifecycleAudioSource struct {
@@ -293,6 +293,7 @@ func TestInboundVideoUpgradeWaitsForExplicitAcceptance(t *testing.T) {
 
 func TestVideoAcceptanceRequestsSourceKeyframe(t *testing.T) {
 	eng, call := testEngineWithOutgoingCall()
+	eng.calls[call.ID()].videoGate = true
 	eng.calls[call.ID()].videoTx = &videoSender{}
 	eng.sendCallNode = func(context.Context, waBinary.Node) error { return nil }
 	var requests int
@@ -581,5 +582,74 @@ func TestFinishCallClosesAttachedAudioDevices(t *testing.T) {
 	}
 	if sink.closeCount != 1 {
 		t.Fatalf("audio sink close count = %d, want 1", sink.closeCount)
+	}
+}
+
+func TestInboundLateVideoAcceptDoesNotRestartStoppedLocalFlow(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	m := eng.calls[call.ID()]
+	m.localVideo = false
+	m.videoGate = false
+	m.videoTx = &videoSender{}
+	sent := 0
+	eng.sendCallNode = func(context.Context, waBinary.Node) error { sent++; return nil }
+	eng.onVideoStanza(videoStateNode(signaling.VideoStateUpgradeAccept))
+	if call.IsSendingVideo() || sent != 0 {
+		t.Fatal("unsolicited/late acceptance re-enabled stopped local video")
+	}
+}
+func TestVideoTransitionsUseBoundedNetworkContext(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	eng.sendCallNode = func(ctx context.Context, _ waBinary.Node) error {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("video transmit has no deadline")
+		}
+		return nil
+	}
+	if err := call.StartVideo(); err != nil {
+		t.Fatal(err)
+	}
+	eng.onVideoStanza(videoStateNode(signaling.VideoStateUpgradeAccept))
+	if err := call.StopVideo(); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestCallRemoteKeyframeRequestIsCoalescedAndHasNoNetwork(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	eng.sendCallNode = func(context.Context, waBinary.Node) error { t.Fatal("keyframe request used signaling"); return nil }
+	for i := 0; i < 100; i++ {
+		if err := call.RequestVideoKeyframe(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !eng.pendingVideoKeyframeRequest(call.ID(), false) || !eng.pendingVideoKeyframeRequest(call.ID(), true) || eng.pendingVideoKeyframeRequest(call.ID(), false) {
+		t.Fatal("keyframe requests not coalesced/consumed")
+	}
+}
+func TestCallVideoAcceptAdvertisesOnlyImplementedCodec(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	eng.calls[call.ID()].peerVideoUpgrade = true
+	eng.sendCallNode = func(_ context.Context, n waBinary.Node) error {
+		v := n.GetChildren()[0]
+		if v.AttrGetter().Int("state") == signaling.VideoStateUpgradeAccept && v.AttrGetter().String("dec") != "H264" {
+			t.Fatal("advertised an unimplemented video decoder")
+		}
+		return nil
+	}
+	if err := call.AcceptVideo(); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestVideoAnnouncementFailureDoesNotAcknowledgeUpgrade(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	m := eng.calls[call.ID()]
+	m.videoGate = true
+	m.videoTx = &videoSender{active: true, sendGated: true}
+	eng.sendCallNode = func(context.Context, waBinary.Node) error { return errors.New("transport unavailable") }
+	var got VideoState
+	call.OnVideoState(func(v VideoState) { got = v })
+	eng.onVideoStanza(videoStateNode(signaling.VideoStateUpgradeAccept))
+	if got.Raw == signaling.VideoStateUpgradeAccept || got.Active || call.IsSendingVideo() {
+		t.Fatal("failed local announcement still acknowledged local video")
 	}
 }

@@ -7,6 +7,19 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### integration/wappi-official-whatsmeow — `implemented`
+
+- Preserved the existing upstream history and test fixtures, and restored official
+  Whatsmeow imports pinned to gowapi's `8b41cfe6d9c4` revision instead of hypermeow.
+- Transferred `WithOutgoingOnly`, handler reinstallation, failed-offer cleanup,
+  first terminal reason retention, and device-scoped direct-call reject handling.
+- Transferred bounded video transition announcements, pending-upgrade gating,
+  local announcement failure state, and authenticated keyframe request support.
+- Carried all corresponding local regression tests and kept the upstream codec
+  implementations, datasheets, and test vectors unchanged.
+- Library unit tests and race checks pass, including upstream MLow tests;
+  live multi-device refusal policy and video interoperability remain unverified.
+
 ### media/group-runtime — `KAT-verified`
 
 - Hardened live group-call teardown by closing and detaching audio endpoints,

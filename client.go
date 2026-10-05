@@ -9,8 +9,8 @@ import (
 
 	"github.com/purpshell/meowcaller/diag"
 	"github.com/rs/zerolog"
-	"github.com/polymorfa/hypermeow"
-	"github.com/polymorfa/hypermeow/types"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // Client is the managed entry point to the WhatsApp calling stack. It wraps a
@@ -19,10 +19,11 @@ import (
 //
 // The library never configures logging; pass WithLogger to surface its debug/trace.
 type Client struct {
-	wa   *whatsmeow.Client
-	log  zerolog.Logger
-	diag *diag.Recorder
-	eng  *engine
+	wa           *whatsmeow.Client
+	log          zerolog.Logger
+	diag         *diag.Recorder
+	eng          *engine
+	outgoingOnly bool
 
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 	ownGroupJIDs func() []types.JID
@@ -52,7 +53,7 @@ type GroupCallOptions struct {
 func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 	cfg := resolveConfig(opts)
 	c := &Client{
-		wa: wa, log: cfg.log, diag: cfg.diag,
+		wa: wa, log: cfg.log, diag: cfg.diag, outgoingOnly: cfg.outgoingOnly,
 		getGroupInfo: wa.GetGroupInfo,
 		ownGroupJIDs: func() []types.JID {
 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}
@@ -225,3 +226,8 @@ func (c *Client) incomingCallHandler() func(*Call) {
 	defer c.mu.Unlock()
 	return c.onIncomingCall
 }
+
+// ReinstallEventHandler restores this wrapper's event subscription after legacy
+// code calls Whatsmeow.RemoveEventHandlers. It does not reinstall raw node hooks.
+// Call before adding handlers that mutate event metadata. Calls are idempotent.
+func (c *Client) ReinstallEventHandler() { c.eng.installEventHandler() }

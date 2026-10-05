@@ -6,7 +6,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/polymorfa/hypermeow/types"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // Video in meowcaller is encoded H.264, carried as Annex-B access units (one frame's worth
@@ -44,6 +44,8 @@ func (f VideoSinkFunc) Close() error { return nil }
 // VideoState is the peer's video state from a mid-call <video> stanza, delivered to
 // Call.OnVideoState.
 type VideoState struct {
+	// LocalFailed reports a failed local enabled announcement; Raw is downgraded to rejection.
+	LocalFailed bool
 	// Active reports the peer's camera is on (state == 1).
 	Active bool
 	// Upgrade reports a mid-call audio→video upgrade (state == 11).

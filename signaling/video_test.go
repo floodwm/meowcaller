@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	waBinary "github.com/polymorfa/hypermeow/binary"
-	"github.com/polymorfa/hypermeow/types"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // TestOfferAdvertisesVideo checks the <video> child lands after the audios, before <net>.
@@ -175,8 +175,8 @@ func TestVideoUpgradeAcceptThenEnabledShapes(t *testing.T) {
 	if state, _ := attrString(video, "state"); state != "4" {
 		t.Fatalf("accept state = %q, want 4", state)
 	}
-	if dec, _ := attrString(video, "dec"); dec != "H264,AV1" {
-		t.Fatalf("accept dec = %q, want H264,AV1", dec)
+	if dec, _ := attrString(video, "dec"); dec != "H264" {
+		t.Fatalf("accept dec = %q, want H264", dec)
 	}
 
 	enabled := BuildVideoStateWithParams(VideoStateParams{

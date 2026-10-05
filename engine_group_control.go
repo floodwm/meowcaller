@@ -8,13 +8,16 @@ import (
 	"fmt"
 
 	"github.com/purpshell/meowcaller/signaling"
-	waBinary "github.com/polymorfa/hypermeow/binary"
-	"github.com/polymorfa/hypermeow/proto/waE2E"
-	"github.com/polymorfa/hypermeow/types"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
 func (e *engine) onUnknownCallEvent(node *waBinary.Node) {
+	if e.c.outgoingOnly && !e.ownsCallNode(node) {
+		return
+	}
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/48c2391ce9f7dcc2b3f223f72f1b5f0c627ad943/datasheets/voip-group-update-ingest.md#L105-L148
 	envelope, err := signaling.ParseCallControlEnvelope(node)
 	if err != nil {

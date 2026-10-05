@@ -5,13 +5,14 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Option configures optional, non-behavioral aspects of the call/media types —
+// Option configures optional, aspects of the call/media types —
 // currently the diagnostic logger. The zero configuration logs nothing.
 type Option func(*config)
 
 type config struct {
-	log  zerolog.Logger
-	diag *diag.Recorder
+	log          zerolog.Logger
+	diag         *diag.Recorder
+	outgoingOnly bool
 }
 
 func resolveConfig(opts []Option) config {
@@ -37,3 +38,6 @@ func WithLogger(l zerolog.Logger) Option {
 func WithDiagnostics(rec *diag.Recorder) Option {
 	return func(c *config) { c.diag = rec }
 }
+
+// WithOutgoingOnly leaves unsolicited incoming calls to other Whatsmeow handlers.
+func WithOutgoingOnly() Option { return func(c *config) { c.outgoingOnly = true } }

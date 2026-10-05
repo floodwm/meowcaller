@@ -15,11 +15,11 @@ import (
 	"unsafe"
 
 	"github.com/purpshell/meowcaller/signaling"
-	"github.com/polymorfa/hypermeow"
-	waBinary "github.com/polymorfa/hypermeow/binary"
-	"github.com/polymorfa/hypermeow/proto/waE2E"
-	"github.com/polymorfa/hypermeow/types"
-	"github.com/polymorfa/hypermeow/types/events"
+	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -30,7 +30,9 @@ import (
 // sink). This is where the orchestration formerly hand-rolled in examples/cli has been
 // lifted to; Client and Call are the public face over it.
 type engine struct {
-	c *Client
+	c              *Client
+	eventHandlerMu sync.Mutex
+	eventHandlerID uint32
 
 	mu              sync.Mutex
 	calls           map[string]*engineCall // keyed by call-id
@@ -53,26 +55,28 @@ type engineCall struct {
 	creator types.JID // call-creator JID (for accept/relaylatency)
 	from    types.JID // the <call> "from" — where stanzas are addressed
 
-	direction         CallDirection
-	codec             AudioCodec   // audio codec for this call, selected from voip_settings (MLow default)
-	localVideo        bool         // this client is sending, or has requested to send, video
-	remoteVideo       bool         // the peer is sending video to this client
-	videoGate         bool         // outbound upgrade is waiting for peer acceptance
-	peerVideoUpgrade  bool         // the peer's inbound upgrade is waiting for local acceptance
-	videoTx           *videoSender // video send pipeline, live while media runs
-	appDataTx         *appDataSender
-	rekeyPeer         func(string) error
-	group             bool
-	groupUpdate       *groupCallUpdate
-	groupReceivers    *participantReceiveRegistry
-	groupRawEpoch     []byte
-	groupEpochTxID    uint32
-	hasGroupEpoch     bool
-	started           bool
-	cancel            context.CancelFunc // tears down this call's media goroutine
-	waitingRoomCancel context.CancelFunc
-	inviteSelfDevice  groupCallDevice
-	invitePeerDevice  groupCallDevice
+	direction              CallDirection
+	codec                  AudioCodec // audio codec for this call, selected from voip_settings (MLow default)
+	localVideo             bool       // this client is sending, or has requested to send, video
+	remoteVideo            bool       // the peer is sending video to this client
+	videoGate              bool       // outbound upgrade is waiting for peer acceptance
+	videoKeyframeRequested bool
+	peerVideoUpgrade       bool         // the peer's inbound upgrade is waiting for local acceptance
+	videoTx                *videoSender // video send pipeline, live while media runs
+	appDataTx              *appDataSender
+	rekeyPeer              func(string) error
+	group                  bool
+	groupUpdate            *groupCallUpdate
+	groupReceivers         *participantReceiveRegistry
+	groupRawEpoch          []byte
+	groupEpochTxID         uint32
+	hasGroupEpoch          bool
+	started                bool
+	cancel                 context.CancelFunc // tears down this call's media goroutine
+	waitingRoomCancel      context.CancelFunc
+	inviteSelfDevice       groupCallDevice
+	invitePeerDevice       groupCallDevice
+	acceptedPeerDevice     types.JID // authoritative answering device, independent of capability metadata
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
 	acceptPending bool
@@ -151,9 +155,21 @@ func (e *engine) install() {
 		e.mu.Unlock()
 		e.c.log.Error().Err(err).Msg("raw call adapter is unavailable")
 	}
-	e.c.wa.AddEventHandler(func(evt any) {
+	e.installEventHandler()
+}
+
+func (e *engine) installEventHandler() {
+	e.eventHandlerMu.Lock()
+	defer e.eventHandlerMu.Unlock()
+	if e.eventHandlerID != 0 {
+		e.c.wa.RemoveEventHandler(e.eventHandlerID)
+	}
+	e.eventHandlerID = e.c.wa.AddEventHandler(func(evt any) {
 		switch ev := evt.(type) {
 		case *events.CallOffer:
+			if e.c.outgoingOnly {
+				return
+			}
 			e.onOffer(ev)
 		case *events.CallPreAccept:
 			e.onPreAccept(ev)
@@ -297,7 +313,9 @@ func (e *engine) transitionVideo(callID string, transition int) error {
 		})
 	}
 	send := func(state int, dec string, orientation *int) error {
-		return e.transmitCallNode(context.Background(), build(state, dec, orientation))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return e.transmitCallNode(ctx, build(state, dec, orientation))
 	}
 
 	var err error
@@ -404,6 +422,9 @@ func (e *engine) setVideoOrientation(callID string, orientation int) error {
 // placeCall resolves target to a LID, builds and sends the <offer>, registers the Call,
 // and returns it; media starts when the peer answers and the relay endpoint arrives.
 func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions) (*Call, error) {
+	if err := e.requireRawCallAdapter(); err != nil {
+		return nil, err
+	}
 	cli := e.c.wa
 	self := cli.Store.GetLID()
 	if self.IsEmpty() {
@@ -495,7 +516,7 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 		"call_key_hex": hex.EncodeToString(callKey[:]),
 	})
 
-	if err := cli.DangerousInternals().SendNode(ctx, offer); err != nil {
+	if err := e.sendOutgoingOffer(ctx, call, offer); err != nil {
 		return nil, fmt.Errorf("send offer: %w", err)
 	}
 	e.c.log.Info().Str("call_id", callID).Bool("video", opts.Video).Msg("offer sent; media starts when the relay endpoint arrives")
@@ -880,6 +901,7 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 	var rekeyPeer func(string) error
 	answeringPeer := ev.From.String()
 	if current := e.calls[ev.CallID]; current != nil {
+		current.acceptedPeerDevice = ev.From
 		if device, ok := inviteDeviceCapability(ev.From, ev.Data); ok {
 			current.invitePeerDevice = device
 		}
@@ -964,6 +986,30 @@ func (e *engine) onReject(ev *events.CallReject) {
 	if m == nil {
 		return
 	}
+	reason := ""
+	if ev.Data != nil {
+		reason = ev.Data.AttrGetter().String("reason")
+	}
+	if m.direction == CallDirectionOutgoing && !m.group {
+		e.mu.Lock()
+		accepted := m.acceptedPeerDevice
+		e.mu.Unlock()
+		// A rejection from a different device cannot undo an accepted call.
+		// Before acceptance, linked devices can reject an unsupported invitation
+		// while the phone keeps ringing. Only explicit user refusal/busy or the
+		// primary device's rejection is authoritative at that point.
+		if !accepted.IsEmpty() {
+			if ev.From != accepted {
+				return
+			}
+		} else if ev.From.Device != 0 {
+			switch reason {
+			case "busy", "rejected", "declined", "decline":
+			default:
+				return
+			}
+		}
+	}
 	e.c.log.Info().
 		Str("call_id", ev.CallID).
 		Str("from", ev.From.String()).
@@ -971,7 +1017,11 @@ func (e *engine) onReject(ev *events.CallReject) {
 	e.c.diag.Emit("meta", map[string]any{
 		"event": "peer_reject", "call_id": ev.CallID, "from": ev.From.String(),
 	})
-	e.finishCall(ev.CallID, "rejected")
+	endReason := "rejected"
+	if reason == "busy" {
+		endReason = "busy"
+	}
+	e.finishCall(ev.CallID, endReason)
 }
 
 // rlProbe is one relay candidate from a relaylatency probe.
@@ -1051,6 +1101,9 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 // it has fully handled the node (including sending the appropriate ack), so the caller skips
 // whatsmeow's generic typeless ack.
 func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
+	if e.c.outgoingOnly && !e.ownsCallNode(callNode) {
+		return false
+	}
 	kids := callNode.GetChildren()
 	if len(kids) == 0 {
 		return false
@@ -1159,6 +1212,7 @@ func (e *engine) onVideoStanza(v *waBinary.Node) {
 	disableSender := false
 	enableSender := false
 	announceEnabled := false
+	localFailed := false
 	switch state {
 	case signaling.VideoStateUpgradeRequest, signaling.VideoStateUpgradeRequestV2:
 		m.peerVideoUpgrade = true
@@ -1172,9 +1226,10 @@ func (e *engine) onVideoStanza(v *waBinary.Node) {
 	case signaling.VideoStateDisabled, signaling.VideoStateStopped:
 		m.remoteVideo = false
 	case signaling.VideoStateUpgradeAccept:
-		m.localVideo = true
-		m.videoGate = false
-		announceEnabled = true
+		if m.localVideo && m.videoGate {
+			m.videoGate = false
+			announceEnabled = true
+		}
 	case signaling.VideoStateUpgradeReject, signaling.VideoStateUpgradeCancel:
 		m.peerVideoUpgrade = false
 		if m.videoGate {
@@ -1190,7 +1245,10 @@ func (e *engine) onVideoStanza(v *waBinary.Node) {
 			CallID: callID, To: to, CallCreator: creator, WrapperID: e.nextCallNodeID(),
 			State: signaling.VideoStateEnabled, DeviceOrientation: &orientation,
 		})
-		if err := e.transmitCallNode(context.Background(), node); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := e.transmitCallNode(ctx, node)
+		cancel()
+		if err != nil {
 			e.mu.Lock()
 			if current := e.calls[callID]; current == m {
 				current.localVideo = false
@@ -1198,6 +1256,8 @@ func (e *engine) onVideoStanza(v *waBinary.Node) {
 			}
 			e.mu.Unlock()
 			disableSender = true
+			localFailed = true
+			state = signaling.VideoStateUpgradeReject
 			announceEnabled = false
 			if e.c != nil {
 				e.c.log.Warn().Err(err).Str("call_id", callID).Msg("video enabled announcement failed")
@@ -1220,6 +1280,7 @@ func (e *engine) onVideoStanza(v *waBinary.Node) {
 	if call != nil {
 		if fn := call.onVideoStateFn(); fn != nil {
 			fn(VideoState{
+				LocalFailed: localFailed,
 				Active:      state == signaling.VideoStateEnabled,
 				Upgrade:     state == signaling.VideoStateUpgradeRequest || state == signaling.VideoStateUpgradeRequestV2,
 				Orientation: orientation,
@@ -1272,6 +1333,7 @@ func (e *engine) finishCall(callID, reason string) {
 		return
 	}
 	call.mu.Lock()
+	call.endReason = reason
 	player := call.player
 	call.player = nil
 	sink := call.sink
@@ -1680,4 +1742,39 @@ func getMediaRelayEndpoint(rd *relayData, inbound bool) *relayEndpoint {
 		return &rd.endpoints[0]
 	}
 	return nil
+}
+
+// ownsCallNode prevents unsolicited control traffic from triggering side effects.
+func (e *engine) ownsCallNode(node *waBinary.Node) bool {
+	if node == nil {
+		return false
+	}
+	callID := node.AttrGetter().OptionalString("call-id")
+	if kids := node.GetChildren(); len(kids) > 0 {
+		callID = kids[0].AttrGetter().OptionalString("call-id")
+	}
+	return callID != "" && e.lookup(callID) != nil
+}
+
+// sendOutgoingOffer releases the registered call if its initial invitation fails.
+func (e *engine) sendOutgoingOffer(ctx context.Context, call *Call, offer waBinary.Node) error {
+	if err := e.transmitCallNode(ctx, offer); err != nil {
+		e.finishCall(call.ID(), "offer_failed")
+		return err
+	}
+	return nil
+}
+
+func (e *engine) pendingVideoKeyframeRequest(callID string, consume bool) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	m := e.calls[callID]
+	if m == nil {
+		return false
+	}
+	pending := m.videoKeyframeRequested
+	if consume {
+		m.videoKeyframeRequested = false
+	}
+	return pending
 }
