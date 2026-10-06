@@ -1,8 +1,11 @@
 package relay
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"net"
+	"time"
 
 	"github.com/pion/datachannel"
 	"github.com/pion/dtls/v3"
@@ -74,16 +77,30 @@ func (e *CallTransportError) Unwrap() error { return e.Err }
 // RelayMediaChannel is an open relay media channel; STUN/RTP/RTCP travel as binary
 // DataChannel messages. It owns the whole stack so Close tears it down cleanly
 // (the reference relies on Rust Drop; Go needs explicit cleanup).
+type relayDataChannel interface {
+	io.ReadWriteCloser
+	datachannel.ReadDeadliner
+}
+
 type RelayMediaChannel struct {
-	udp      net.PacketConn
-	dtlsConn net.Conn
-	assoc    *sctp.Association
-	dc       *datachannel.DataChannel
-	log      zerolog.Logger
+	udp             net.PacketConn
+	dtlsConn        net.Conn
+	assoc           *sctp.Association
+	dc              relayDataChannel
+	log             zerolog.Logger
+	stopContext     func() bool
+	cancelOnClose   context.CancelFunc
+	readIdleTimeout time.Duration
 }
 
 // Close tears down the media stack in reverse order of construction.
 func (c *RelayMediaChannel) Close() error {
+	if c.stopContext != nil {
+		c.stopContext()
+	}
+	if c.cancelOnClose != nil {
+		c.cancelOnClose()
+	}
 	c.log.Debug().Msg("tearing down relay media channel")
 	var firstErr error
 	for _, closer := range []func() error{c.dc.Close, c.assoc.Close, c.dtlsConn.Close, c.udp.Close} {
@@ -114,6 +131,11 @@ func (c *RelayMediaChannel) Send(data []byte) (int, error) {
 func (c *RelayMediaChannel) Recv(buf []byte) (int, error) {
 	// NOT VALIDATED: no vector exists for the live transport; exercised only against a real relay.
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/transport.rs#L126-L132
+	if c.readIdleTimeout > 0 {
+		if err := c.dc.SetReadDeadline(time.Now().Add(c.readIdleTimeout)); err != nil {
+			return 0, &CallTransportError{Op: "recv", Err: err}
+		}
+	}
 	n, err := c.dc.Read(buf)
 	if err != nil {
 		c.log.Debug().Err(err).Msg("relay recv failed")
@@ -127,6 +149,11 @@ func (c *RelayMediaChannel) Recv(buf []byte) (int, error) {
 // relay endpoint. Self-signed cert; server-cert verification skipped (media auth is
 // HBH SRTP, not DTLS). No vector — validated only against a live relay.
 func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChannel, error) {
+	return ConnectRelayMediaContext(context.Background(), relayAddr, opts...)
+}
+
+// ConnectRelayMediaContext connects relay media and closes transport on cancellation.
+func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChannel, error) {
 	// NOT VALIDATED: no vector exists for the live transport; exercised only against a real relay.
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/transport.rs#L136-L195
 	cfg := resolveConfig(opts)
@@ -143,12 +170,24 @@ func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChann
 	}
 
 	// 1. UDP socket.
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	var udp net.PacketConn
+	var err error
+	if cfg.proxyURL != "" {
+		udp, err = DialSOCKS5UDP(ctx, cfg.proxyURL)
+	} else {
+		localIP := net.IPv4zero
+		if relayAddr.IP.To4() == nil {
+			localIP = net.IPv6unspecified
+		}
+		udp, err = net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: 0})
+	}
 	if err != nil {
 		lg.Debug().Err(err).Msg("relay media connect failed")
 		return nil, &CallTransportError{Op: "connect", Err: fmt.Errorf("bind udp: %w", err)}
 	}
 	cleanup = append(cleanup, udp.Close)
+	stopContext := context.AfterFunc(ctx, func() { udp.Close() })
+	cleanup = append(cleanup, func() error { stopContext(); return nil })
 	lg.Debug().Str("local_addr", udp.LocalAddr().String()).Msg("relay udp socket bound")
 
 	// 2. DTLS client (self-signed cert; skip server-cert verification).
@@ -186,5 +225,5 @@ func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChann
 	}
 	lg.Debug().Str("label", DataChannelLabel).Msg("relay datachannel open")
 
-	return &RelayMediaChannel{udp: udp, dtlsConn: dtlsConn, assoc: assoc, dc: dc, log: lg}, nil
+	return &RelayMediaChannel{udp: udp, dtlsConn: dtlsConn, assoc: assoc, dc: dc, log: lg, stopContext: stopContext, cancelOnClose: cfg.cancelOnClose, readIdleTimeout: cfg.readIdleTimeout}, nil
 }

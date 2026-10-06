@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/purpshell/meowcaller/diag"
+	"github.com/purpshell/meowcaller/relay"
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
@@ -34,6 +35,8 @@ type Client struct {
 
 // CallOptions controls media negotiated for an outbound call.
 type CallOptions struct {
+	// MediaProxy selects SOCKS5 UDP for this call. Empty preserves direct media.
+	MediaProxy string
 	// Video advertises a WhatsApp video call. The caller must provide encoded H.264
 	// access units with Call.SendVideo after media is active.
 	Video bool
@@ -74,7 +77,17 @@ func (c *Client) Call(ctx context.Context, target string) (*Call, error) {
 
 // CallWithOptions places a 1:1 call with explicit media options.
 func (c *Client) CallWithOptions(ctx context.Context, target string, opts CallOptions) (*Call, error) {
+	if opts.MediaProxy != "" {
+		if err := relay.ValidateSOCKS5Proxy(opts.MediaProxy); err != nil {
+			return nil, err
+		}
+	}
 	return c.eng.placeCall(ctx, target, opts)
+}
+
+// CallWithMediaProxy places a direct call using a per-call SOCKS5 media route.
+func (c *Client) CallWithMediaProxy(ctx context.Context, target, proxyURL string) (*Call, error) {
+	return c.CallWithOptions(ctx, target, CallOptions{MediaProxy: proxyURL})
 }
 
 // GroupCall places an audio group call to at least two remote targets.

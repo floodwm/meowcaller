@@ -5,7 +5,9 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -188,6 +190,48 @@ func BuildWasmStunAllocateRequest(transactionID [12]byte, relayToken []byte, end
 // calls must carry the SSRCs derived from the current call ID and participant LID.
 func BuildWasmStunAllocateRequestWithStreamSsrcs(transactionID [12]byte, relayToken []byte, endpointXor [6]byte, streamSsrcs [9]uint32, integrityKey []byte, log ...zerolog.Logger) []byte {
 	return buildWasmStunAllocateRequest(transactionID, relayToken, endpointXor, CreateWasmStreamDescriptors(streamSsrcs), integrityKey, log...)
+}
+
+// EncodeXorRelayAddress returns the IPv4 or IPv6 XOR-address attribute value.
+func EncodeXorRelayAddress(endpoint netip.AddrPort, transactionID [12]byte) ([]byte, error) {
+	// Source of truth: https://www.rfc-editor.org/rfc/rfc8489.html#section-14.2
+	if !endpoint.IsValid() || endpoint.Port() == 0 || endpoint.Addr().Zone() != "" {
+		return nil, errors.New("invalid relay address")
+	}
+	ip := endpoint.Addr().Unmap()
+	size, family := 4, byte(1)
+	if ip.Is6() {
+		size, family = 16, 2
+	}
+	value := make([]byte, 4+size)
+	value[1] = family
+	binary.BigEndian.PutUint16(value[2:4], endpoint.Port()^stunXorPort)
+	mask := [16]byte{0x21, 0x12, 0xa4, 0x42}
+	copy(mask[4:], transactionID[:])
+	for i, b := range ip.AsSlice() {
+		value[4+i] = b ^ mask[i]
+	}
+	return value, nil
+}
+
+// BuildWasmStunAllocateRequestForAddress builds a direct-call allocate for either IP family.
+func BuildWasmStunAllocateRequestForAddress(transactionID [12]byte, relayToken []byte, endpoint netip.AddrPort, streamSsrcs [9]uint32, integrityKey []byte, log ...zerolog.Logger) ([]byte, error) {
+	// Source of truth: https://www.rfc-editor.org/rfc/rfc8489.html#section-14.2
+	// Source of truth: ../datasheets/ipv6-relay.md — observed IPv6 relay address mismatch.
+	maskTx := transactionID
+	if endpoint.IsValid() && endpoint.Addr().Unmap().Is6() {
+		for i := 0; i < 12; i += 4 {
+			maskTx[i], maskTx[i+1], maskTx[i+2], maskTx[i+3] = transactionID[i+3], transactionID[i+2], transactionID[i+1], transactionID[i]
+		}
+	}
+	value, err := EncodeXorRelayAddress(endpoint, maskTx)
+	if err != nil {
+		return nil, err
+	}
+	attrs := stunAttr(attrRelayToken, relayToken)
+	attrs = append(attrs, stunAttr(attrStreamDescriptors, CreateWasmStreamDescriptors(streamSsrcs))...)
+	attrs = append(attrs, stunAttr(attrWasmRelayEndpoint, value)...)
+	return EncodeStunRequest(MsgAllocateRequest, transactionID, attrs, integrityKey, false, pickLog(log)), nil
 }
 
 // BuildWasmStunAllocateRequestWithGroupSubscriptions adds the participant-specific
@@ -504,6 +548,24 @@ func ParseStunAttributes(data []byte, log ...zerolog.Logger) []StunAttribute {
 	}
 	lg.Trace().Int("attr_count", len(attrs)).Int("packet_bytes", len(data)).Msg("parsed stun attributes")
 	return attrs
+}
+
+// ErrorReasonKind returns a fixed diagnostic category, never the wire reason text.
+func ErrorReasonKind(data []byte) string {
+	// Source of truth: https://www.rfc-editor.org/rfc/rfc8489.html#section-14.8
+	for _, attr := range ParseStunAttributes(data) {
+		if attr.AttrType != attrErrorCode || len(attr.Value) < 4 {
+			continue
+		}
+		text := strings.ToLower(string(attr.Value[4:]))
+		for _, kind := range []string{"integrity", "token", "family", "endpoint", "address", "expired", "quota", "permission", "credential", "unsupported"} {
+			if strings.Contains(text, kind) {
+				return kind
+			}
+		}
+		return "unknown"
+	}
+	return "none"
 }
 
 // ParseStunErrorCode parses the numeric error code (class*100+number); ok=false if absent.

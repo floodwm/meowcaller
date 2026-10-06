@@ -1,13 +1,37 @@
 package relay
 
-import "github.com/rs/zerolog"
+import (
+	"context"
+	"time"
 
-// Option configures optional, non-behavioral aspects of the relay channel —
-// currently the diagnostic logger. The zero configuration logs nothing.
+	"github.com/rs/zerolog"
+)
+
+// Option configures the relay channel's transport and diagnostic logger.
 type Option func(*config)
 
 type config struct {
-	log zerolog.Logger
+	log             zerolog.Logger
+	proxyURL        string
+	cancelOnClose   context.CancelFunc
+	readIdleTimeout time.Duration
+}
+
+// WithReadIdleTimeout bounds a receive wait while the relay stops replying.
+func WithReadIdleTimeout(timeout time.Duration) Option {
+	// Source of truth: datasheets/socks5_udp.md
+	return func(c *config) { c.readIdleTimeout = timeout }
+}
+
+// WithCancelOnClose releases a transport context when a successfully constructed
+// channel closes. The caller retains ownership if construction fails.
+func WithCancelOnClose(cancel context.CancelFunc) Option {
+	return func(c *config) { c.cancelOnClose = cancel }
+}
+
+// WithSOCKS5Proxy routes relay datagrams through a SOCKS5 UDP association.
+func WithSOCKS5Proxy(proxyURL string) Option {
+	return func(c *config) { c.proxyURL = proxyURL }
 }
 
 func resolveConfig(opts []Option) config {

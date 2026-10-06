@@ -7,6 +7,42 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### relay/ipv6 — `implemented`
+
+- Retain packed IPv6 relay candidates and merge them with matching IPv4 endpoint
+  metadata. Prefer IPv6 for proxied direct calls; retain IPv4 preference without
+  a proxy. Configured media still always travels through SOCKS5.
+- Bind an IPv6 UDP socket for direct IPv6 candidates.
+- Retry IPv4 through the same SOCKS5 proxy after IPv6 transport setup failure;
+  cancellation stops retries and direct calls retain their existing selection.
+- Add RFC IPv6 XOR-address encoding with the RFC 5769 known-answer vector; keep
+  existing IPv4 Allocate bytes unchanged.
+- WhatsApp's IPv6 Allocate masks the transaction ID as three byte-reversed
+  uint32 words, while the STUN header retains the original ID. Verified against
+  a live IPv6 relay: Allocate Success over the existing profile SOCKS5 proxy.
+- Add metadata-only family/route/STUN diagnostics. Raw diagnostics stay disabled.
+  Answered dev call maintained IPv6 SOCKS5 media for 26 seconds with nonzero
+  audio frames in both directions and normal test hangup. Subjective audibility
+  is awaiting recipient confirmation.
+
+### relay/socks5-udp — `implemented`
+
+- Added per-call `CallOptions.MediaProxy` / `CallWithMediaProxy`, validated before
+  signaling, with SOCKS5 UDP ASSOCIATE and optional RFC1929 authentication.
+- Relay DTLS/SCTP/DataChannel reuse a SOCKS5 PacketConn for audio and video.
+  Configured proxy failures never open a direct destination socket.
+- Keep the TCP control session alive and close UDP on control EOF, cancellation,
+  or setup timeout. Successful channels own cancellation until teardown.
+- Bound relay receive inactivity to 30 seconds in the calling engine, including
+  established calls where UDP drops while the proxy TCP control stays alive.
+- Native media failures retain `media_proxy_failed` (or `media_failed` without
+  a proxy), clean up the call, and send terminate to the correct call creator.
+- Local IPv4/IPv6 framing vectors, authenticated datagram roundtrips, failure,
+  cancellation, deadline, no-bypass and terminal-reason regression tests pass.
+  Full suite, race suite and vet pass. Live IPv6 SOCKS5 relay/allocation and
+  nonzero bidirectional audio are verified above; live outage/failover and
+  handset audio perception remain unverified.
+
 ### integration/wappi-official-whatsmeow — `implemented`
 
 - Preserved the existing upstream history and test fixtures, and restored official

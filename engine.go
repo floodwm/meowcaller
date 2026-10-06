@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -46,11 +47,12 @@ type engine struct {
 // which can arrive separately), the media goroutine cancel handle, and the deferred
 // accept bookkeeping.
 type engineCall struct {
-	call    *Call
-	callKey []byte
-	relay   *relayData
-	selfLID string
-	peerLID string
+	mediaProxy string
+	call       *Call
+	callKey    []byte
+	relay      *relayData
+	selfLID    string
+	peerLID    string
 
 	creator types.JID // call-creator JID (for accept/relaylatency)
 	from    types.JID // the <call> "from" — where stanzas are addressed
@@ -503,6 +505,7 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 	m.from = peerLID
 	m.direction = CallDirectionOutgoing
 	m.localVideo = opts.Video
+	m.mediaProxy = opts.MediaProxy
 	m.remoteVideo = opts.Video
 	m.inviteSelfDevice = groupCallDevice{
 		JID: self, CapabilityVersion: 1,
@@ -795,6 +798,9 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 		}
 	}
 	e.mu.Unlock()
+	v4, v6, other := relayCandidateCounts(r)
+	e.c.log.Info().Int("ipv4", v4).Int("ipv6", v6).Int("unsupported", other).
+		Msg("relay candidate families")
 	if rekeyPeer != nil {
 		if err := rekeyPeer(peerLID); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Str("peer_lid", peerLID).
@@ -1558,6 +1564,7 @@ func newCallID() string {
 
 type relayAddress struct {
 	ipv4 string
+	ipv6 string
 	port uint16
 }
 
@@ -1677,6 +1684,25 @@ func parseIndexedTokens(node *waBinary.Node, tag string) [][]byte {
 	return tokens
 }
 
+// relayCandidateCounts reports packed-address lengths without keying material.
+func relayCandidateCounts(node *waBinary.Node) (ipv4, ipv6, unsupported int) {
+	// Source of truth: https://wacrg.org/spec/relay/relay-candidates/#te2-endpoint
+	for _, child := range node.GetChildren() {
+		if child.Tag != "te2" {
+			continue
+		}
+		switch len(nodeBytes(&child)) {
+		case 6:
+			ipv4++
+		case 18:
+			ipv6++
+		default:
+			unsupported++
+		}
+	}
+	return
+}
+
 // parseRelayData ports parse_relay_data: <key>, indexed <token>, and te2 endpoints.
 func parseRelayData(node *waBinary.Node) *relayData {
 	rd := &relayData{}
@@ -1697,7 +1723,16 @@ func parseRelayData(node *waBinary.Node) *relayData {
 			continue
 		}
 		ab := nodeBytes(child)
-		if len(ab) != 6 { // IPv4:port only (IPv6 endpoints skipped)
+		// Source of truth: https://wacrg.org/spec/relay/relay-candidates/#te2-endpoint
+		address := relayAddress{}
+		switch len(ab) {
+		case 6:
+			address.ipv4 = netip.AddrFrom4([4]byte(ab[:4])).String()
+			address.port = binary.BigEndian.Uint16(ab[4:6])
+		case 18:
+			address.ipv6 = netip.AddrFrom16([16]byte(ab[:16])).String()
+			address.port = binary.BigEndian.Uint16(ab[16:18])
+		default:
 			continue
 		}
 		ep := relayEndpoint{
@@ -1706,14 +1741,40 @@ func parseRelayData(node *waBinary.Node) *relayData {
 			tokenID:     attrUint(child, "token_id"),
 			authTokenID: attrUint(child, "auth_token_id"),
 			isFNA:       child.AttrGetter().String("is_fna") == "1",
-			addresses: []relayAddress{{
-				ipv4: fmt.Sprintf("%d.%d.%d.%d", ab[0], ab[1], ab[2], ab[3]),
-				port: binary.BigEndian.Uint16(ab[4:6]),
-			}},
+			addresses:   []relayAddress{address},
 		}
-		rd.endpoints = append(rd.endpoints, ep)
+		merged := false
+		for j := range rd.endpoints {
+			previous := &rd.endpoints[j]
+			if previous.relayID == ep.relayID && previous.relayName == ep.relayName &&
+				previous.tokenID == ep.tokenID && previous.authTokenID == ep.authTokenID && previous.isFNA == ep.isFNA {
+				previous.addresses = append(previous.addresses, address)
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			rd.endpoints = append(rd.endpoints, ep)
+		}
 	}
 	return rd
+}
+
+func selectMediaRelayAddress(ep *relayEndpoint, preferIPv6 bool) (netip.AddrPort, error) {
+	// Source of truth: https://wacrg.org/spec/relay/relay-candidates/#te2-endpoint
+	for _, wantIPv6 := range []bool{preferIPv6, !preferIPv6} {
+		for _, candidate := range ep.addresses {
+			raw := candidate.ipv4
+			if wantIPv6 {
+				raw = candidate.ipv6
+			}
+			ip, err := netip.ParseAddr(raw)
+			if err == nil && ip.Zone() == "" && ip.IsGlobalUnicast() && candidate.port != 0 {
+				return netip.AddrPortFrom(ip.Unmap(), candidate.port), nil
+			}
+		}
+	}
+	return netip.AddrPort{}, errors.New("relay has no usable IP address")
 }
 
 // getMediaRelayEndpoint prefers an outbound (non-FNA, auth_token_id≠0) endpoint, else
