@@ -7,6 +7,25 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### integration/passive-incoming — `implemented`
+
+- Add `WithIncomingPolicy`, `IncomingCallInfo` and `IncomingCallPolicy` to gate
+  unsolicited direct offers before key decryption, preaccept or media setup.
+  Denied offers, policy errors, invalid proxies and group calls leave other
+  WhatsApp devices able to answer.
+- Freeze the permitted call's media proxy and leave local video disabled until
+  the operator explicitly enables it.
+- Add `Call.Abandon()` for passive cleanup without provider reject/terminate;
+  suppress late control packets after abandonment or an answer on another device.
+- Ignore linked-device refusals for policy-managed incoming calls; preserve
+  remote refusals and existing outgoing/default upstream behavior.
+- Gate unknown control events as well as raw call nodes, so unowned encrypted
+  rekeys never reach group key processing in policy-managed mode.
+- Preserve passive cleanup before Answer even when an end callback invokes
+  Hangup or Reject. Unit and race tests cover policy gates, route snapshots,
+  local teardown, callbacks and accepted-elsewhere cleanup. Codec vectors remain
+  unchanged; fresh live handset compatibility is not established by these tests.
+
 ### relay/ipv6 — `implemented`
 
 - Retain packed IPv6 relay candidates and merge them with matching IPv4 endpoint

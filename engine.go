@@ -15,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/purpshell/meowcaller/relay"
 	"github.com/purpshell/meowcaller/signaling"
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -35,11 +36,13 @@ type engine struct {
 	eventHandlerMu sync.Mutex
 	eventHandlerID uint32
 
-	mu              sync.Mutex
-	calls           map[string]*engineCall // keyed by call-id
-	sendCallNode    func(context.Context, waBinary.Node) error
-	requestCallNode func(context.Context, waBinary.Node, string) (*waBinary.Node, error)
-	rawCallHookErr  error
+	mu                   sync.Mutex
+	calls                map[string]*engineCall
+	pendingMediaFailures map[string]*engineCall // keyed by call-id
+	sendCallNode         func(context.Context, waBinary.Node) error
+	requestCallNode      func(context.Context, waBinary.Node, string) (*waBinary.Node, error)
+	rawCallHookErr       error
+	decryptOfferKey      func(context.Context, *events.CallOffer) ([]byte, error)
 }
 
 // engineCall is the engine's per-call state: the public Call handle plus the inputs
@@ -47,12 +50,13 @@ type engine struct {
 // which can arrive separately), the media goroutine cancel handle, and the deferred
 // accept bookkeeping.
 type engineCall struct {
-	mediaProxy string
-	call       *Call
-	callKey    []byte
-	relay      *relayData
-	selfLID    string
-	peerLID    string
+	mediaProxy       string
+	incomingAnswered bool
+	call             *Call
+	callKey          []byte
+	relay            *relayData
+	selfLID          string
+	peerLID          string
 
 	creator types.JID // call-creator JID (for accept/relaylatency)
 	from    types.JID // the <call> "from" — where stanzas are addressed
@@ -87,6 +91,9 @@ type engineCall struct {
 // newEngine creates the engine for a Client.
 func newEngine(c *Client) *engine {
 	e := &engine{c: c, calls: map[string]*engineCall{}}
+	e.decryptOfferKey = func(ctx context.Context, ev *events.CallOffer) ([]byte, error) {
+		return decryptInboundCallKey(ctx, c.wa, ev)
+	}
 	if c != nil && c.wa != nil {
 		e.sendCallNode = func(ctx context.Context, node waBinary.Node) error {
 			return c.wa.DangerousInternals().SendNode(ctx, node)
@@ -533,26 +540,48 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 // OnIncomingCall listener. Only the <accept> is deferred to Answer.
 func (e *engine) onOffer(ev *events.CallOffer) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
+	if e.c.outgoingOnly || ev.Data == nil {
+		return
+	}
+	oag := ev.Data.AttrGetter()
+	if oag.OptionalString("is_call_ended") == "1" || oag.OptionalString("terminate_reason") != "" {
+		if e.c.incomingPolicy != nil {
+			e.finishPassiveIncoming(ev.CallID, oag.OptionalString("terminate_reason"))
+		}
+		return
+	}
+	if e.c.incomingPolicy != nil && e.lookup(ev.CallID) != nil {
+		return
+	}
 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
 	if groupErr != nil {
 		e.c.log.Warn().Err(groupErr).Str("call_id", ev.CallID).Msg("parse inbound group offer failed")
 		return
+	}
+	policy := IncomingCallPolicy{Allow: true}
+	if e.c.outgoingOnly {
+		return
+	}
+	if e.c.incomingPolicy != nil {
+		peer := ev.CallCreator
+		if peer.IsEmpty() {
+			peer = ev.From
+		}
+		var err error
+		policy, err = e.c.incomingPolicy(IncomingCallInfo{ProviderID: ev.CallID, From: peer.String(), Video: signaling.OfferHasVideo(ev.Data), Group: isGroup})
+		if err != nil || !policy.Allow || isGroup {
+			return
+		}
+		if policy.MediaProxy != "" && relay.ValidateSOCKS5Proxy(policy.MediaProxy) != nil {
+			return
+		}
 	}
 	if isGroup {
 		e.onGroupOffer(ev, groupCallUpdateFromSignaling(*groupSnapshot))
 		return
 	}
 
-	// A "call ended" notification arrives offer-shaped, carrying is_call_ended/
-	// terminate_reason (e.g. accepted_elsewhere). It is not a live call — engaging it
-	// (preaccept/accept) just earns an "accept error 500". Ignore it.
-	oag := ev.Data.AttrGetter()
-	if oag.OptionalString("is_call_ended") == "1" || oag.OptionalString("terminate_reason") != "" {
-		e.c.log.Warn().Str("call_id", ev.CallID).Msg("ignoring already-ended offer; not a live call")
-		return
-	}
-
-	callKey, err := decryptInboundCallKey(context.Background(), e.c.wa, ev)
+	callKey, err := e.decryptOfferKey(context.Background(), ev)
 	if err != nil {
 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("decrypt callKey failed")
 		return
@@ -577,6 +606,7 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	m := e.entry(ev.CallID)
 	m.call = call
 	m.callKey = callKey
+	m.mediaProxy = policy.MediaProxy
 	m.selfLID = e.c.wa.Store.GetLID().String()
 	m.peerLID = peer.String()
 	m.creator = ev.CallCreator
@@ -584,7 +614,7 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	m.direction = CallDirectionIncoming
 	// A <video> child marks a call that starts with both video directions enabled.
 	isVideo := signaling.OfferHasVideo(ev.Data)
-	m.localVideo = isVideo
+	m.localVideo = isVideo && e.c.incomingPolicy == nil
 	m.remoteVideo = isVideo
 	m.inviteSelfDevice = groupCallDevice{
 		JID: e.c.wa.Store.GetLID(), CapabilityVersion: 1,
@@ -676,7 +706,7 @@ func (e *engine) sendPreaccept(callID string, to, creator types.JID, video bool)
 		[]string{"16000"},
 		video,
 	)
-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), pre); err != nil {
+	if err := e.transmitCallNode(context.Background(), pre); err != nil {
 		return fmt.Errorf("send preaccept: %w", err)
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("preaccepted (preparation; awaiting Answer/Reject)")
@@ -707,6 +737,7 @@ func (e *engine) answer(c *Call) error {
 	}
 	e.mu.Lock()
 	m.acceptPending = true
+	m.incomingAnswered = true
 	e.mu.Unlock()
 
 	c.setPhase(CallPhaseConnecting)
@@ -743,6 +774,13 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 
 // reject declines an inbound call.
 func (e *engine) reject(c *Call) error {
+	c.signalingMu.Lock()
+	passive := c.passiveEnded
+	c.signalingMu.Unlock()
+	if passive {
+		return nil
+	}
+
 	m := e.lookup(c.id)
 	to, creator := c.peer, c.peer
 	if m != nil {
@@ -751,6 +789,11 @@ func (e *engine) reject(c *Call) error {
 	rej := signaling.BuildReject(c.id, to, creator)
 	rej.Attrs["id"] = e.nextCallNodeID()
 	e.finishCall(c.id, "rejected")
+	c.signalingMu.Lock()
+	defer c.signalingMu.Unlock()
+	if c.passiveEnded {
+		return nil
+	}
 	if err := e.transmitCallNode(context.Background(), rej); err != nil {
 		return fmt.Errorf("send reject: %w", err)
 	}
@@ -759,6 +802,13 @@ func (e *engine) reject(c *Call) error {
 
 // hangup ends a call (either direction) and tears down its media.
 func (e *engine) hangup(c *Call) error {
+	c.signalingMu.Lock()
+	passive := c.passiveEnded
+	c.signalingMu.Unlock()
+	if passive {
+		return nil
+	}
+
 	m := e.lookup(c.id)
 	to, creator := c.peer, c.peer
 	if m != nil {
@@ -767,6 +817,11 @@ func (e *engine) hangup(c *Call) error {
 	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: c.id, To: to, CallCreator: creator})
 	term.Attrs["id"] = e.nextCallNodeID()
 	e.finishCall(c.id, "hangup")
+	c.signalingMu.Lock()
+	defer c.signalingMu.Unlock()
+	if c.passiveEnded {
+		return nil
+	}
 	if err := e.transmitCallNode(context.Background(), term); err != nil {
 		return fmt.Errorf("send terminate: %w", err)
 	}
@@ -992,6 +1047,12 @@ func (e *engine) onReject(ev *events.CallReject) {
 	if m == nil {
 		return
 	}
+	if m.direction == CallDirectionIncoming && e.c.incomingPolicy != nil && e.c.wa != nil && e.c.wa.Store != nil {
+		sender := ev.From.ToNonAD()
+		if !sender.IsEmpty() && (sender == e.c.wa.Store.GetJID().ToNonAD() || sender == e.c.wa.Store.GetLID().ToNonAD()) {
+			return
+		}
+	}
 	reason := ""
 	if ev.Data != nil {
 		reason = ev.Data.AttrGetter().String("reason")
@@ -1107,7 +1168,7 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 // it has fully handled the node (including sending the appropriate ack), so the caller skips
 // whatsmeow's generic typeless ack.
 func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
-	if e.c.outgoingOnly && !e.ownsCallNode(callNode) {
+	if (e.c.outgoingOnly || e.c.incomingPolicy != nil) && !e.ownsCallNode(callNode) {
 		return false
 	}
 	kids := callNode.GetChildren()
@@ -1299,7 +1360,27 @@ func (e *engine) onVideoStanza(v *waBinary.Node) {
 // onTerminate tears down a call's media and fires the Call's OnEnd listener.
 func (e *engine) onTerminate(callID, reason string) {
 	e.c.log.Info().Str("call_id", callID).Str("reason", reason).Msg("call terminated")
+	if reason == "accepted_elsewhere" && e.c.incomingPolicy != nil && e.finishPassiveIncoming(callID, reason) {
+		return
+	}
 	e.finishCall(callID, reason)
+}
+
+func (e *engine) finishPassiveIncoming(callID, reason string) bool {
+	e.mu.Lock()
+	m := e.calls[callID]
+	if m == nil {
+		m = e.pendingMediaFailures[callID]
+	}
+	e.mu.Unlock()
+	if m == nil || m.call == nil || m.direction != CallDirectionIncoming {
+		return false
+	}
+	m.call.signalingMu.Lock()
+	m.call.passiveEnded = true
+	m.call.signalingMu.Unlock()
+	e.finishCall(callID, reason)
+	return true
 }
 
 func (e *engine) finishCall(callID, reason string) {

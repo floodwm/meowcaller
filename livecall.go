@@ -13,9 +13,11 @@ import (
 // Call is one live direct or group call. A direct call may become an ad-hoc group
 // call through AddParticipant. All methods are safe for concurrent use.
 type Call struct {
-	eng  *engine
-	id   string
-	peer types.JID
+	signalingMu  sync.Mutex
+	passiveEnded bool
+	eng          *engine
+	id           string
+	peer         types.JID
 
 	mu                        sync.Mutex
 	phase                     CallPhase
@@ -790,5 +792,14 @@ func (c *Call) RequestVideoKeyframe() error {
 		return errors.New("meowcaller: call is not active")
 	}
 	m.videoKeyframeRequested = true
+	return nil
+}
+
+// Abandon releases local call resources without notifying any WhatsApp device.
+func (c *Call) Abandon() error {
+	c.signalingMu.Lock()
+	c.passiveEnded = true
+	c.signalingMu.Unlock()
+	c.eng.finishCall(c.id, "abandoned")
 	return nil
 }

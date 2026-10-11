@@ -15,7 +15,7 @@ import (
 )
 
 func (e *engine) onUnknownCallEvent(node *waBinary.Node) {
-	if e.c.outgoingOnly && !e.ownsCallNode(node) {
+	if (e.c.outgoingOnly || e.c.incomingPolicy != nil) && !e.ownsCallNode(node) {
 		return
 	}
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/48c2391ce9f7dcc2b3f223f72f1b5f0c627ad943/datasheets/voip-group-update-ingest.md#L105-L148

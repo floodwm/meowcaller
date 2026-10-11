@@ -1565,15 +1565,36 @@ func (e *engine) finishMediaFailure(callID, reason string) {
 		return
 	}
 	to, creator := m.from, m.creator
-	e.mu.Unlock()
-	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: callID, To: to, CallCreator: creator})
-	term.Attrs["id"] = e.nextCallNodeID()
-	e.finishCall(callID, reason)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := e.transmitCallNode(ctx, term); err != nil {
-		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media failure terminate failed")
+	passive := m.direction == CallDirectionIncoming && e.c.incomingPolicy != nil && !m.incomingAnswered
+	if e.pendingMediaFailures == nil {
+		e.pendingMediaFailures = make(map[string]*engineCall)
 	}
+	e.pendingMediaFailures[callID] = m
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		if e.pendingMediaFailures[callID] == m {
+			delete(e.pendingMediaFailures, callID)
+		}
+		e.mu.Unlock()
+	}()
+	if passive {
+		m.call.signalingMu.Lock()
+		m.call.passiveEnded = true
+		m.call.signalingMu.Unlock()
+	}
+	e.finishCall(callID, reason)
+	m.call.signalingMu.Lock()
+	if !passive && !m.call.passiveEnded {
+		term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: callID, To: to, CallCreator: creator})
+		term.Attrs["id"] = e.nextCallNodeID()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := e.transmitCallNode(ctx, term); err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media failure terminate failed")
+		}
+		cancel()
+	}
+	m.call.signalingMu.Unlock()
 }
 
 func mediaFailureReason(proxyURL string, err error) string {

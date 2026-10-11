@@ -10,9 +10,10 @@ import (
 type Option func(*config)
 
 type config struct {
-	log          zerolog.Logger
-	diag         *diag.Recorder
-	outgoingOnly bool
+	log            zerolog.Logger
+	diag           *diag.Recorder
+	outgoingOnly   bool
+	incomingPolicy func(IncomingCallInfo) (IncomingCallPolicy, error)
 }
 
 func resolveConfig(opts []Option) config {
@@ -41,3 +42,9 @@ func WithDiagnostics(rec *diag.Recorder) Option {
 
 // WithOutgoingOnly leaves unsolicited incoming calls to other Whatsmeow handlers.
 func WithOutgoingOnly() Option { return func(c *config) { c.outgoingOnly = true } }
+
+// WithIncomingPolicy evaluates incoming offers before signaling or media setup.
+// Errors, denied offers, invalid media proxies and group calls are passively ignored.
+func WithIncomingPolicy(policy func(IncomingCallInfo) (IncomingCallPolicy, error)) Option {
+	return func(c *config) { c.incomingPolicy = policy }
+}
